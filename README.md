@@ -13,13 +13,21 @@
 
 ## Özellikler
 
-- 32x32 piksel çizim alanı: kalem, silgi, boya kovası, renk seçici
+- **32x32, 48x48 veya 64x64** piksel çizim alanı: kalem, silgi, boya kovası, renk seçici
 - Tıklama noktası (hotspot) ayarı
 - Hazır şablonlar: Neon Piksel Ok, RPG Piksel Kılıç, FPS Nişangah
-- PNG / JPG / WEBP görselleri piksel imlece dönüştürme
+- PNG / JPG / WEBP / GIF görselleri piksel imlece dönüştürme
+  (boş kenarlar kırpılır, en-boy oranı korunur, tuvale ortalanır)
 - `.cur` olarak dışa aktarma
 - İmleci sisteme uygulama (normal ok, el, nişangah veya hepsi) ve tek tıkla varsayılana dönme
+- **Kalıcı imleç:** uygulanan imleç bilgisayar yeniden başlasa da kalır
+- **Ekranda boyut:** imleci Windows'ta 32 / 48 / 64 piksel büyüklüğünde gösterebilirsin
+- **Otomatik kayıt:** uygulamayı kapatıp açtığında son çalışman kaldığı yerden devam eder
+- **Geçmiş sekmesi:** yüklenen görseller, kaydedilen ve uygulanan imleçler küçük
+  önizlemeleriyle listelenir; tek tıkla açılır veya uygulanır
 - Geri al (Ctrl+Z)
+
+Ayarlar ve geçmiş `%APPDATA%\PixelCursorStudio` klasöründe tutulur.
 
 ## Kaynak koddan çalıştırma
 

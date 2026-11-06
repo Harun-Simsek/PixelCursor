@@ -1,0 +1,9 @@
+{
+  "version": "4.0.0",
+  "exe_url": "https://raw.githubusercontent.com/Harun-Simsek/PixelCursor/main/PixelCursor.exe",
+  "exe_sha256": "21e59e9a31759db10886f5783a06eeec8e66ffc9f368d53246a6328a9aea6604",
+  "exe_size": 18338973,
+  "pyw_url": "https://raw.githubusercontent.com/Harun-Simsek/PixelCursor/main/PixelCursor.pyw",
+  "pyw_sha256": "81668994f101bd2b39fa6410796017de1d99ff254c31c4d0ef592c7a9ae9f881",
+  "pyw_size": 85511
+}

@@ -14,6 +14,10 @@
 #   - Uygulanan imleç kayıt defterine yazılır; bilgisayar yeniden başlasa da kalır
 #   - 32x32 / 48x48 / 64x64 tuval; görseller oran korunarak ve kırpılarak aktarılır
 #
+# SÜRÜM 4:
+#   - Türkçe / İngilizce arayüz (sağ üstteki TR / EN)
+#   - "Güncellemeleri denetle": yeni sürüm varsa sorar, indirir, doğrular ve kendini günceller
+#
 # SÜRÜM 3:
 #   - Yüklerken arka planı otomatik kaldırma + "Arka Planı Kaldır" düğmesi
 #   - Sihirli silgi (benzer renkli bölgeyi siler), Alan silgisi (dikdörtgen)
@@ -22,9 +26,14 @@
 # ============================================================================
 
 import os
+import re
 import sys
 import json
 import time
+import hashlib
+import queue
+import urllib.request
+import webbrowser
 import struct
 import ctypes
 import tempfile
@@ -176,12 +185,261 @@ TOOL_HINTS = {
     "area": "Alan silgisi: sürükleyerek bir dikdörtgen çiz, içi silinir.",
     "hotspot": "Tıklama noktası: imlecin tıklayan ucunu seç.",
 }
+TOOL_HINTS_EN = {
+    "pencil": "Pencil: left-click to draw. Right-click erases with any tool.",
+    "eraser": "Eraser: erases at the brush size.",
+    "fill": "Paint bucket: fills the same-colored area.",
+    "picker": "Color picker: picks the color of the clicked pixel.",
+    "magic": "Magic eraser: removes the connected area similar to the clicked color (uses Tolerance).",
+    "area": "Area eraser: drag a rectangle to clear its inside.",
+    "hotspot": "Click point: choose the tip of the cursor that clicks.",
+}
 
 BG = "#181825"
 PANEL = "#1E1E2E"
 FG = "#CDD6F4"
 MUTED = "#A6ADC8"
 BTN = "#313244"
+
+
+# ---------------------------------------------------------------------------
+# Sürüm ve güncelleme
+# Yeni sürüm yayınlamak için: EXE_Olustur.bat çalıştır (sürümü artırır, exe'yi
+# derler ve version.json'u üretir), sonra hepsini GitHub'a gönder.
+# ---------------------------------------------------------------------------
+APP_VERSION = "4.0.0"
+GITHUB_REPO = "Harun-Simsek/PixelCursor"
+RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main"
+UPDATE_INFO_URL = f"{RAW_BASE}/version.json"
+REPO_PAGE_URL = f"https://github.com/{GITHUB_REPO}"
+
+
+def parse_version(v) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3]) or (0,)
+
+
+def fetch_update_info(timeout: float = 8.0) -> dict:
+    url = f"{UPDATE_INFO_URL}?nocache={int(time.time())}"
+    req = urllib.request.Request(url, headers={"User-Agent": f"PixelCursor/{APP_VERSION}",
+                                               "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def download_file(url: str, dest: str, progress=None, timeout: float = 30.0) -> str:
+    """Dosyayı indirir, ilerlemeyi progress(okunan, toplam) ile bildirir, SHA-256 döndürür."""
+    req = urllib.request.Request(url, headers={"User-Agent": f"PixelCursor/{APP_VERSION}"})
+    sha = hashlib.sha256()
+    with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = r.read(256 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            sha.update(chunk)
+            done += len(chunk)
+            if progress:
+                progress(done, total)
+    return sha.hexdigest()
+
+
+def file_sha256(path: str) -> str:
+    sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+def clean_env_for_relaunch() -> dict:
+    """PyInstaller'ın tek-dosya exe'si kendini yeniden başlatırken eski geçici
+    klasörü kullanmasın diye ortam değişkenlerini temizler."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("_PYI", "_MEIPASS"))}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
+def cleanup_old_exe():
+    """Önceki güncellemeden kalan .old dosyasını siler (çalışırken silinemediği için)."""
+    if IS_FROZEN:
+        old = sys.executable + ".old"
+        try:
+            if os.path.exists(old):
+                os.remove(old)
+        except OSError:
+            pass
+
+
+def make_version_json(folder: str) -> dict:
+    """Derleme betiği için: klasördeki exe ve pyw'nin sürüm/özet bilgisini yazar."""
+    info = {"version": APP_VERSION}
+    for key, name in (("exe", "PixelCursor.exe"), ("pyw", "PixelCursor.pyw")):
+        path = os.path.join(folder, name)
+        if not os.path.exists(path):
+            continue
+        with open(path, "rb") as f:
+            data = f.read()
+        if key == "pyw":
+            # Git (.gitattributes: text=auto) metin dosyalarını depoda LF satır sonuyla saklar;
+            # indirilen dosya da LF olacağı için özet LF haline göre hesaplanır.
+            data = data.replace(b"\r\n", b"\n")
+        info[f"{key}_url"] = f"{RAW_BASE}/{name}"
+        info[f"{key}_sha256"] = hashlib.sha256(data).hexdigest()
+        info[f"{key}_size"] = len(data)
+    with open(os.path.join(folder, "version.json"), "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=2)
+    return info
+
+
+def bump_version_in_file(path: str, new_version: str = "") -> str:
+    """PixelCursor.pyw içindeki APP_VERSION'ı yeni sürüme (boşsa bir artırarak) ayarlar."""
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    current = re.search(r'APP_VERSION = "([^"]+)"', text).group(1)
+    if not new_version.strip():
+        parts = list(parse_version(current)) + [0, 0]
+        new_version = f"{parts[0]}.{parts[1]}.{parts[2] + 1}"
+    new_version = new_version.strip()
+    text = text.replace(f'APP_VERSION = "{current}"', f'APP_VERSION = "{new_version}"', 1)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    return new_version
+
+
+# ---------------------------------------------------------------------------
+# Dil desteği: metinler Türkçe yazılır, İngilizce karşılıkları bu tablodadır.
+# T("metin {x}", x=1) seçili dile çevirir ve {..} alanlarını doldurur.
+# ---------------------------------------------------------------------------
+LANG = "tr"
+EN = {
+    "PixelCursor Studio - İmleç Tasarla & Değiştir": "PixelCursor Studio - Design & Change Cursors",
+    "ARAÇLAR": "TOOLS",
+    "Kalem": "Pencil",
+    "Silgi": "Eraser",
+    "Boya Kovası": "Paint Bucket",
+    "Renk Seçici": "Color Picker",
+    "Sihirli Silgi": "Magic Eraser",
+    "Alan Silgisi": "Area Eraser",
+    "Tıklama Noktası (Hotspot)": "Click Point (Hotspot)",
+    "Fırça:": "Brush:",
+    "Tolerans:": "Tolerance:",
+    "Izgarayı Göster": "Show Grid",
+    "TUVAL BOYUTU": "CANVAS SIZE",
+    "AKTİF RENK": "ACTIVE COLOR",
+    "Özel Renk Seç": "Custom Color",
+    "TUVAL İŞLEMLERİ": "CANVAS ACTIONS",
+    "Arka Planı Kaldır": "Remove Background",
+    "Geri Al (Ctrl+Z)": "Undo (Ctrl+Z)",
+    "Temizle": "Clear",
+    "HAZIR ŞABLONLAR": "TEMPLATES",
+    "Neon Ok": "Neon Arrow",
+    "Kılıç": "Sword",
+    "Nişangah": "Crosshair",
+    "İMLEÇ": "CURSOR",
+    "GEÇMİŞ": "HISTORY",
+    "GERÇEK BOYUT (1:1)": "ACTUAL SIZE (1:1)",
+    "DOSYA İŞLEMLERİ": "FILE",
+    "Görsel Yükle (PNG/JPG/GIF)": "Import Image (PNG/JPG/GIF)",
+    "Yüklerken arka planı otomatik kaldır": "Remove background automatically on import",
+    ".CUR Olarak Kaydet": "Save as .CUR",
+    "BİLGİSAYARA UYGULA": "APPLY TO COMPUTER",
+    "Standart Fare Oku": "Standard Arrow",
+    "El İmleci (Link Seçimi)": "Hand (Link Select)",
+    "Nişangah (Crosshair)": "Crosshair",
+    "Tüm Ana İmleçler": "All Main Cursors",
+    "Ekranda boyut:": "On-screen size:",
+    "Windows ayarı": "Windows default",
+    "İMLECİ ŞİMDİ UYGULA": "APPLY CURSOR NOW",
+    "Varsayılan Windows İmlecine Dön": "Restore Default Windows Cursor",
+    "Hazır.": "Ready.",
+    "Yüklenen görseller ve\nuygulanan imleçler": "Imported images and\napplied cursors",
+    "Henüz geçmiş yok.\nGörsel yüklediğinde veya imleç\nuyguladığında burada görünür.":
+        "No history yet.\nImported images and applied\ncursors will appear here.",
+    "Aç": "Open",
+    "Uygula": "Apply",
+    "Sil": "Delete",
+    "Görsel": "Image",
+    "Uygulandı": "Applied",
+    "Kaydedildi": "Saved",
+    "Standart ok": "Standard arrow",
+    "El imleci": "Hand cursor",
+    "Tüm imleçler": "All cursors",
+    "{n}x{n} PİKSEL TASARIM ALANI (Sol Tık: Çiz / Sağ Tık: Sil)": "{n}x{n} PIXEL CANVAS (Left click: Draw / Right click: Erase)",
+    "Boyut: {n}x{n}\nHotspot: ({x}, {y})": "Size: {n}x{n}\nHotspot: ({x}, {y})",
+    "Tuval {n}x{n} olarak ayarlandı.": "Canvas set to {n}x{n}.",
+    "Renk Seç": "Choose Color",
+    "Geri alınacak işlem yok.": "Nothing to undo.",
+    "Son işlem geri alındı.": "Last action undone.",
+    "Tuval temizlendi.": "Canvas cleared.",
+    "Tıklama noktası ({x}, {y}) olarak ayarlandı.": "Click point set to ({x}, {y}).",
+    "Renk seçildi: {c}": "Color picked: {c}",
+    "Sihirli silgi: {n} piksel silindi.": "Magic eraser: {n} pixels removed.",
+    "Alan silindi: {w}x{h} piksel.": "Area cleared: {w}x{h} pixels.",
+    "Tuval zaten boş.": "The canvas is already empty.",
+    "Kenarlara bağlı bir arka plan bulunamadı. Sihirli silgi veya Alan silgisini dene.":
+        "No background connected to the edges was found. Try the Magic or Area eraser.",
+    "Arka plan orijinal görselden kaldırıldı ve nesne tuvale sığdırıldı. Fazla/az sildiyse Ctrl+Z yapıp Tolerans'ı değiştir.":
+        "Background removed from the original image and the object was fitted to the canvas. If it removed too much/little, press Ctrl+Z and change Tolerance.",
+    "Arka plan kaldırıldı ({n} / {total} piksel). Fazla/az sildiyse Ctrl+Z yapıp Tolerans'ı değiştir.":
+        "Background removed ({n} / {total} pixels). If it removed too much/little, press Ctrl+Z and change Tolerance.",
+    "İmleç İçin Görsel Seç": "Choose an Image for the Cursor",
+    "Görsel Dosyaları": "Image Files",
+    "Tüm Dosyalar": "All Files",
+    "Görsel desteği hazırlanıyor (Pillow), lütfen bekleyin...": "Preparing image support (Pillow), please wait...",
+    "Pillow Bulunamadı": "Pillow Not Found",
+    "Görsel yüklemek için gereken Pillow kütüphanesi kurulamadı.\nİnternet bağlantınızı kontrol edip tekrar deneyin.":
+        "The Pillow library needed to import images could not be installed.\nCheck your internet connection and try again.",
+    " Arka plan kaldırıldı.": " Background removed.",
+    "'{name}' {n}x{n} piksel olarak aktarıldı ve geçmişe eklendi.{extra}": "'{name}' imported as {n}x{n} pixels and added to history.{extra}",
+    "Görsel Hatası": "Image Error",
+    "Görsel yüklenemedi:\n{e}": "Could not load the image:\n{e}",
+    "İmleci Kaydet": "Save Cursor",
+    "Windows İmleç Dosyası": "Windows Cursor File",
+    "Kaydedildi: {name}": "Saved: {name}",
+    "Kayıt Hatası": "Save Error",
+    "Dosya kaydedilemedi:\n{e}": "Could not save the file:\n{e}",
+    "Platform Uyarısı": "Platform Warning",
+    "Sistem imleci değiştirme yalnızca Windows'ta çalışır.": "Changing the system cursor only works on Windows.",
+    "Uyarı": "Warning",
+    "Tamamen boş bir imleç uygulayamazsınız! Lütfen önce çizim yapın.": "You can't apply an empty cursor! Please draw something first.",
+    "İmleç uygulandı ve kalıcı olarak kaydedildi. Bilgisayar yeniden başlasa da kalacak.":
+        "Cursor applied and saved permanently. It will stay after restarting the computer.",
+    "İmleç uygulandı ama kalıcı kaydedilemedi ({e}). Yeniden başlatınca sıfırlanabilir.":
+        "Cursor applied but could not be saved permanently ({e}). It may reset after a restart.",
+    "Sistem Hatası": "System Error",
+    "İmleç uygulanırken hata oluştu:\n{e}": "An error occurred while applying the cursor:\n{e}",
+    "Varsayılan Windows imleci geri yüklendi.": "Default Windows cursor restored.",
+    "Varsayılan imleç geri yüklenemedi:\n{e}": "Could not restore the default cursor:\n{e}",
+    "Son çalışman geri yüklendi.": "Your last work was restored.",
+    "Geçmişi Temizle": "Clear History",
+    "Tüm geçmiş silinsin mi?": "Delete all history?",
+    "Geçmişten açıldı: {name}": "Opened from history: {name}",
+    "Güncellemeleri denetle": "Check for updates",
+    "Denetleniyor...": "Checking...",
+    "Yeni sürüm: v{v}": "New version: v{v}",
+    "Güncelleme": "Update",
+    "En güncel sürümü kullanıyorsun (v{v}).": "You're using the latest version (v{v}).",
+    "Güncelleme sunucusuna ulaşılamadı. İnternet bağlantını kontrol edip tekrar dene.\n\n{e}":
+        "Couldn't reach the update server. Check your internet connection and try again.\n\n{e}",
+    "Yeni bir sürüm var!\n\nSendeki sürüm: v{cur}\nYeni sürüm: v{new}\n\nYeni sürüme güncellemek ister misin?":
+        "A new version is available!\n\nYour version: v{cur}\nNew version: v{new}\n\nDo you want to update to the new version?",
+    "Güncelleniyor": "Updating",
+    "Yeni sürüm indiriliyor... %{p}": "Downloading the new version... {p}%",
+    "Yeni sürüm indiriliyor...": "Downloading the new version...",
+    "İndirilen dosya doğrulanamadı (dosya bozuk veya sunucu henüz güncellenmemiş). Birkaç dakika sonra tekrar dene.":
+        "The downloaded file couldn't be verified (corrupted, or the server isn't updated yet). Try again in a few minutes.",
+    "Güncelleme yapılamadı:\n{e}\n\nİndirme sayfası açılsın mı?":
+        "The update failed:\n{e}\n\nOpen the download page?",
+    "Güncelleme tamamlandı. Uygulama yeniden başlatılıyor...": "Update complete. Restarting the app...",
+}
+
+
+def T(text: str, **kw) -> str:
+    if LANG == "en":
+        text = EN.get(text, text)
+    return text.format(**kw) if kw else text
 
 
 def data_dir() -> str:
@@ -398,7 +656,7 @@ def reload_system_cursors():
 class PixelCursorStudio:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("PixelCursor Studio - İmleç Tasarla & Değiştir")
+        self.root.title(T("PixelCursor Studio - İmleç Tasarla & Değiştir"))
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
 
@@ -407,6 +665,8 @@ class PixelCursorStudio:
         self.history_file = os.path.join(self.data_path, "history.json")
         self.settings = read_json(self.state_file, {})
         self.history = read_json(self.history_file, [])
+        global LANG
+        LANG = self.settings.get("lang", "tr") if self.settings.get("lang") in ("tr", "en") else "tr"
         if not isinstance(self.history, list):
             self.history = []
 
@@ -420,13 +680,17 @@ class PixelCursorStudio:
         self.current_tool = tk.StringVar(value="pencil")
         self.show_grid = tk.BooleanVar(value=True)
         self.target_cursor_mode = tk.StringVar(value=self.settings.get("target_mode", "normal"))
-        self.screen_size = tk.StringVar(value=self.settings.get("screen_size", "Windows ayarı"))
+        size = str(self.settings.get("screen_size", ""))
+        self.screen_size = tk.StringVar(value=size if size.isdigit() else T("Windows ayarı"))
         self.grid_var = tk.IntVar(value=self.grid)
         brush = self.settings.get("brush", 1)
         self.brush_var = tk.IntVar(value=brush if brush in BRUSH_CHOICES else 1)
         self.tolerance_var = tk.IntVar(value=int(self.settings.get("tolerance", 15)))
         self.auto_bg_var = tk.BooleanVar(value=bool(self.settings.get("auto_bg", True)))
         self._area_start = None
+        self._pending_update = None   # açılışta bulunan yeni sürüm bilgisi
+        self._updating = False
+        self._ui_queue = queue.Queue()  # arka plan iş parçacıklarından arayüze mesajlar
         self._import_src = None  # (dosya yolu, ızgara, pikseller) - son yüklenen görsel
         self.hotspot = [0, 0]  # [x, y]
         self._save_job = None
@@ -453,6 +717,11 @@ class PixelCursorStudio:
         self.root.bind("<Control-Z>", lambda e: self.undo())
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.current_tool.trace_add("write", lambda *_: self._show_tool_hint())
+        self._show_tool_hint()
+        cleanup_old_exe()
+        self._poll_ui_queue()
+        # Açılışta sessizce yeni sürüm var mı bak (internet yoksa hiçbir şey göstermez)
+        threading.Thread(target=self._background_update_check, daemon=True).start()
 
     # ------------------------------------------------------------------ UI --
     def _setup_styles(self):
@@ -489,12 +758,13 @@ class PixelCursorStudio:
         self.root.option_add("*TCombobox*Listbox.selectForeground", "#11111B")
 
     def _section(self, parent, text, top=12):
-        tk.Label(parent, text=text, fg=FG, bg=PANEL,
+        tk.Label(parent, text=T(text), fg=FG, bg=PANEL,
                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(top, 4))
 
     def _build_ui(self):
         main_frame = tk.Frame(self.root, bg=BG, padx=16, pady=16)
         main_frame.pack(fill="both", expand=True)
+        self.main_frame = main_frame
 
         # SOL PANEL: Araçlar ve Renk Paleti
         left_panel = tk.Frame(main_frame, bg=PANEL, padx=12, pady=12)
@@ -515,7 +785,7 @@ class PixelCursorStudio:
         for idx, (text, val) in enumerate(tools):
             last = idx == len(tools) - 1
             tk.Radiobutton(
-                tool_grid, text=text, variable=self.current_tool, value=val,
+                tool_grid, text=T(text), variable=self.current_tool, value=val,
                 bg=BTN if val in ("magic", "area") else PANEL, fg=FG, selectcolor="#45475A",
                 activebackground=PANEL, activeforeground="#89B4FA",
                 font=("Segoe UI", 9), indicatoron=False,
@@ -527,7 +797,7 @@ class PixelCursorStudio:
 
         brush_row = tk.Frame(left_panel, bg=PANEL)
         brush_row.pack(fill="x", pady=(6, 0))
-        tk.Label(brush_row, text="Fırça:", fg=MUTED, bg=PANEL,
+        tk.Label(brush_row, text=T("Fırça:"), fg=MUTED, bg=PANEL,
                  font=("Segoe UI", 9)).pack(side="left", padx=(2, 6))
         for b in BRUSH_CHOICES:
             tk.Radiobutton(
@@ -540,7 +810,7 @@ class PixelCursorStudio:
 
         tol_row = tk.Frame(left_panel, bg=PANEL)
         tol_row.pack(fill="x", pady=(4, 0))
-        tk.Label(tol_row, text="Tolerans:", fg=MUTED, bg=PANEL,
+        tk.Label(tol_row, text=T("Tolerans:"), fg=MUTED, bg=PANEL,
                  font=("Segoe UI", 9)).pack(side="left", padx=(2, 0), anchor="s", pady=(0, 2))
         self.tol_value_lbl = tk.Label(tol_row, text=str(self.tolerance_var.get()), fg=FG, bg=PANEL,
                                       font=("Consolas", 9, "bold"), width=3)
@@ -552,7 +822,7 @@ class PixelCursorStudio:
         tol_row.winfo_children()[-1].set(self.tolerance_var.get())
 
         tk.Checkbutton(
-            left_panel, text="Izgarayı Göster", variable=self.show_grid,
+            left_panel, text=T("Izgarayı Göster"), variable=self.show_grid,
             command=self._refresh_canvas_grid, bg=PANEL, fg=MUTED,
             selectcolor=BTN, activebackground=PANEL, font=("Segoe UI", 9)
         ).pack(anchor="w", pady=(2, 0))
@@ -578,7 +848,7 @@ class PixelCursorStudio:
         )
         self.color_preview.pack(side="left", padx=(0, 8))
         tk.Button(
-            color_row, text="Özel Renk Seç", command=self.choose_custom_color,
+            color_row, text=T("Özel Renk Seç"), command=self.choose_custom_color,
             bg=BTN, fg=FG, activebackground="#45475A",
             relief="flat", font=("Segoe UI", 9), padx=8, pady=6
         ).pack(side="left", fill="x", expand=True)
@@ -593,7 +863,7 @@ class PixelCursorStudio:
 
         self._section(left_panel, "TUVAL İŞLEMLERİ", top=6)
         tk.Button(
-            left_panel, text="Arka Planı Kaldır", command=self.remove_background,
+            left_panel, text=T("Arka Planı Kaldır"), command=self.remove_background,
             bg="#9B5DE5", fg="#FFFFFF", activebackground="#B07CF0", activeforeground="#FFFFFF",
             font=("Segoe UI", 9, "bold"), relief="flat", pady=5, cursor="hand2"
         ).pack(fill="x", pady=2)
@@ -601,7 +871,7 @@ class PixelCursorStudio:
         ops_row.pack(fill="x")
         for text, cmd, color in (("Geri Al (Ctrl+Z)", self.undo, BTN),
                                  ("Temizle", self.clear_canvas, "#45475A")):
-            tk.Button(ops_row, text=text, command=cmd, bg=color, fg=FG,
+            tk.Button(ops_row, text=T(text), command=cmd, bg=color, fg=FG,
                       activebackground="#585B70", activeforeground="#FFFFFF",
                       relief="flat", font=("Segoe UI", 9), pady=4, cursor="hand2"
                       ).pack(side="left", fill="x", expand=True, padx=(0, 2) if cmd == self.undo else (2, 0), pady=2)
@@ -612,7 +882,7 @@ class PixelCursorStudio:
         for text, cmd in (("Neon Ok", self._load_template_arrow),
                           ("Kılıç", self._load_template_sword),
                           ("Nişangah", self._load_template_crosshair)):
-            tk.Button(tpl_row, text=text, command=cmd, bg=BTN, fg=FG,
+            tk.Button(tpl_row, text=T(text), command=cmd, bg=BTN, fg=FG,
                       activebackground="#585B70", activeforeground="#FFFFFF",
                       relief="flat", font=("Segoe UI", 9), pady=4, cursor="hand2"
                       ).pack(side="left", fill="x", expand=True, padx=1, pady=2)
@@ -634,7 +904,7 @@ class PixelCursorStudio:
         self.canvas.bind("<ButtonRelease-1>", self.on_left_up)
         self.canvas.bind("<ButtonPress-3>", self.on_right_down)
         self.canvas.bind("<B3-Motion>", self.on_right_drag)
-        self.hint_label = tk.Label(center_panel, text=TOOL_HINTS["pencil"], fg=MUTED, bg=BG,
+        self.hint_label = tk.Label(center_panel, text="", fg=MUTED, bg=BG,
                                    font=("Segoe UI", 9), wraplength=CANVAS_PX, justify="center")
         self.hint_label.pack(pady=(8, 0))
 
@@ -642,15 +912,202 @@ class PixelCursorStudio:
         right_panel = tk.Frame(main_frame, bg=PANEL, padx=10, pady=10)
         right_panel.grid(row=0, column=2, sticky="ns", padx=(14, 0))
 
+        top_row = tk.Frame(right_panel, bg=PANEL)
+        top_row.pack(fill="x", pady=(0, 8))
+        for code in ("tr", "en"):
+            active = LANG == code
+            tk.Button(
+                top_row, text=code.upper(), command=lambda c=code: self.set_language(c),
+                bg="#00F5D4" if active else BTN, fg="#11111B" if active else FG,
+                activebackground="#45475A", relief="flat", font=("Segoe UI", 8, "bold"),
+                width=3, pady=2, cursor="hand2"
+            ).pack(side="left", padx=(0, 3))
+        self.update_btn = tk.Button(
+            top_row, text=T("Güncellemeleri denetle"), command=self.check_for_updates,
+            bg=BTN, fg=FG, activebackground="#45475A", relief="flat",
+            font=("Segoe UI", 8), pady=2, cursor="hand2"
+        )
+        self.update_btn.pack(side="right", fill="x", expand=True, padx=(6, 0))
+        if self._pending_update:
+            self._mark_update_available(self._pending_update)
+
         self.notebook = ttk.Notebook(right_panel, style="Dark.TNotebook")
         self.notebook.pack(fill="both", expand=True)
         tab_main = tk.Frame(self.notebook, bg=PANEL, padx=6, pady=8)
         tab_hist = tk.Frame(self.notebook, bg=PANEL, padx=2, pady=8)
-        self.notebook.add(tab_main, text="İMLEÇ")
-        self.notebook.add(tab_hist, text="GEÇMİŞ")
+        self.notebook.add(tab_main, text=T("İMLEÇ"))
+        self.notebook.add(tab_hist, text=T("GEÇMİŞ"))
 
         self._build_main_tab(tab_main)
         self._build_history_tab(tab_hist)
+
+    # ------------------------------------------------------- GÜNCELLEME --
+    def _post(self, func):
+        """Arka plan iş parçacığından arayüz işlemi iste (Tkinter yalnızca ana iş parçacığında güvenli)."""
+        self._ui_queue.put(func)
+
+    def _poll_ui_queue(self):
+        try:
+            while True:
+                self._ui_queue.get_nowait()()
+        except queue.Empty:
+            pass
+        try:
+            self._poll_job = self.root.after(100, self._poll_ui_queue)
+        except tk.TclError:
+            pass
+
+    def _background_update_check(self):
+        try:
+            info = fetch_update_info(timeout=6)
+        except Exception:
+            return
+        if parse_version(info.get("version")) > parse_version(APP_VERSION):
+            self._post(lambda: self._mark_update_available(info))
+
+    def _mark_update_available(self, info):
+        self._pending_update = info
+        try:
+            self.update_btn.configure(text="⬆ " + T("Yeni sürüm: v{v}", v=info.get("version")),
+                                      bg="#F9E2AF", fg="#11111B")
+        except tk.TclError:
+            pass
+
+    def check_for_updates(self):
+        if self._updating:
+            return
+        self.update_btn.configure(text=T("Denetleniyor..."))
+        self.root.update_idletasks()
+        try:
+            info = fetch_update_info()
+        except Exception as e:
+            self.update_btn.configure(text=T("Güncellemeleri denetle"))
+            messagebox.showerror(T("Güncelleme"), T(
+                "Güncelleme sunucusuna ulaşılamadı. İnternet bağlantını kontrol edip tekrar dene.\n\n{e}", e=e))
+            return
+        new = info.get("version", "0")
+        if parse_version(new) <= parse_version(APP_VERSION):
+            self._pending_update = None
+            self.update_btn.configure(text=T("Güncellemeleri denetle"), bg=BTN, fg=FG)
+            messagebox.showinfo(T("Güncelleme"), T("En güncel sürümü kullanıyorsun (v{v}).", v=APP_VERSION))
+            return
+        self._mark_update_available(info)
+        if messagebox.askyesno(T("Güncelleme"), T(
+                "Yeni bir sürüm var!\n\nSendeki sürüm: v{cur}\nYeni sürüm: v{new}\n\n"
+                "Yeni sürüme güncellemek ister misin?", cur=APP_VERSION, new=new)):
+            self._start_update(info)
+
+    def _start_update(self, info):
+        """İndirmeyi arka planda yapar; arayüz donmaz, ilerleme penceresi gösterir."""
+        kind = "exe" if IS_FROZEN else "pyw"
+        url, expected = info.get(f"{kind}_url"), (info.get(f"{kind}_sha256") or "").lower()
+        target = sys.executable if IS_FROZEN else os.path.abspath(__file__)
+        if not url:
+            self._update_failed("version.json: missing URL")
+            return
+        self._updating = True
+        self._save_now()
+
+        win = tk.Toplevel(self.root)
+        win.title(T("Güncelleniyor"))
+        win.configure(bg=PANEL, padx=20, pady=16)
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+        win.protocol("WM_DELETE_WINDOW", lambda: None)  # indirme sürerken kapatılmasın
+        label = tk.Label(win, text=T("Yeni sürüm indiriliyor..."), fg=FG, bg=PANEL, font=("Segoe UI", 10))
+        label.pack(anchor="w")
+        bar = ttk.Progressbar(win, length=320, mode="determinate", maximum=100)
+        bar.pack(pady=(10, 0))
+        self._update_window = win
+
+        def progress(done, total):
+            if total:
+                pct = int(done * 100 / total)
+                self._post(lambda: (bar.configure(value=pct),
+                                    label.configure(text=T("Yeni sürüm indiriliyor... %{p}", p=pct))))
+
+        def worker():
+            tmp = target + ".download"
+            try:
+                digest = download_file(url, tmp, progress)
+                if expected and digest.lower() != expected:
+                    os.remove(tmp)
+                    raise ValueError(T("İndirilen dosya doğrulanamadı (dosya bozuk veya sunucu henüz "
+                                       "güncellenmemiş). Birkaç dakika sonra tekrar dene."))
+                self._post(lambda: self._install_update(tmp, target))
+            except Exception as e:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+                self._post(lambda e=e: self._update_failed(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _install_update(self, new_file: str, target: str):
+        try:
+            if IS_FROZEN:
+                # Çalışan bir exe silinemez ama yeniden adlandırılabilir:
+                # eskisini .old yap, yenisini yerine koy (.old bir sonraki açılışta silinir).
+                old = target + ".old"
+                if os.path.exists(old):
+                    os.remove(old)
+                os.replace(target, old)
+                try:
+                    os.replace(new_file, target)
+                except Exception:
+                    os.replace(old, target)  # geri al
+                    raise
+                cmd = [target]
+            else:
+                os.replace(new_file, target)
+                cmd = [sys.executable, target]
+        except Exception as e:
+            self._update_failed(e)
+            return
+        self.status_label.configure(text=T("Güncelleme tamamlandı. Uygulama yeniden başlatılıyor..."))
+        self.root.update_idletasks()
+        flags = 0x00000008 if sys.platform == "win32" else 0  # DETACHED_PROCESS
+        subprocess.Popen(cmd, env=clean_env_for_relaunch(), close_fds=True, creationflags=flags,
+                         cwd=os.path.dirname(target))
+        self.on_close()
+
+    def _update_failed(self, error):
+        self._updating = False
+        win = getattr(self, "_update_window", None)
+        if win is not None:
+            try:
+                win.grab_release()
+                win.destroy()
+            except tk.TclError:
+                pass
+            self._update_window = None
+        if messagebox.askyesno(T("Güncelleme"), T("Güncelleme yapılamadı:\n{e}\n\nİndirme sayfası açılsın mı?",
+                                                   e=error)):
+            webbrowser.open(REPO_PAGE_URL)
+
+    def set_language(self, lang: str):
+        """Dili değiştirir ve arayüzü çizimi kaybetmeden yeniden kurar."""
+        global LANG
+        if lang == LANG:
+            return
+        old_default = T("Windows ayarı")
+        LANG = lang
+        self.settings["lang"] = lang
+        if self.screen_size.get() == old_default:
+            self.screen_size.set(T("Windows ayarı"))
+        tab = self.notebook.index("current")
+        self.main_frame.destroy()
+        self.root.title(T("PixelCursor Studio - İmleç Tasarla & Değiştir"))
+        self._build_ui()
+        self._build_canvas_cells()
+        self.redraw_all()
+        self._render_history()
+        self._show_tool_hint()
+        self.notebook.select(tab)
+        self._save_now()
 
     def _build_main_tab(self, tab):
         self._section(tab, "GERÇEK BOYUT (1:1)", top=0)
@@ -671,7 +1128,7 @@ class PixelCursorStudio:
         self._section(tab, "DOSYA İŞLEMLERİ", top=4)
         self._make_btn(tab, "Görsel Yükle (PNG/JPG/GIF)", self.import_image, BTN)
         tk.Checkbutton(
-            tab, text="Yüklerken arka planı otomatik kaldır", variable=self.auto_bg_var,
+            tab, text=T("Yüklerken arka planı otomatik kaldır"), variable=self.auto_bg_var,
             command=self._schedule_save, bg=PANEL, fg=FG, selectcolor=BTN,
             activebackground=PANEL, font=("Segoe UI", 8)
         ).pack(anchor="w", pady=(0, 2))
@@ -686,36 +1143,36 @@ class PixelCursorStudio:
         ]
         for text, val in modes:
             tk.Radiobutton(
-                tab, text=text, variable=self.target_cursor_mode, value=val,
+                tab, text=T(text), variable=self.target_cursor_mode, value=val,
                 bg=PANEL, fg=FG, selectcolor=BTN,
                 activebackground=PANEL, font=("Segoe UI", 9)
             ).pack(anchor="w", pady=0)
 
         size_row = tk.Frame(tab, bg=PANEL)
         size_row.pack(fill="x", pady=(8, 0))
-        tk.Label(size_row, text="Ekranda boyut:", fg=MUTED, bg=PANEL,
+        tk.Label(size_row, text=T("Ekranda boyut:"), fg=MUTED, bg=PANEL,
                  font=("Segoe UI", 9)).pack(side="left")
         ttk.Combobox(
             size_row, textvariable=self.screen_size, state="readonly", width=13,
-            values=("Windows ayarı", "32", "48", "64"), style="Dark.TCombobox"
+            values=(T("Windows ayarı"), "32", "48", "64"), style="Dark.TCombobox"
         ).pack(side="left", padx=(6, 0))
 
         tk.Button(
-            tab, text="İMLECİ ŞİMDİ UYGULA",
+            tab, text=T("İMLECİ ŞİMDİ UYGULA"),
             command=self.apply_cursor_to_system,
             bg="#00F5D4", fg="#11111B", activebackground="#00BBF9",
             font=("Segoe UI", 10, "bold"), relief="flat", pady=9, cursor="hand2"
         ).pack(fill="x", pady=(10, 4))
 
         tk.Button(
-            tab, text="Varsayılan Windows İmlecine Dön",
+            tab, text=T("Varsayılan Windows İmlecine Dön"),
             command=self.restore_default_cursors,
             bg="#F38BA8", fg="#11111B", activebackground="#EBA0AC",
             font=("Segoe UI", 9, "bold"), relief="flat", pady=6, cursor="hand2"
         ).pack(fill="x", pady=2)
 
         self.status_label = tk.Label(
-            tab, text="Hazır.", fg="#A6E3A1", bg=PANEL,
+            tab, text=T("Hazır."), fg="#A6E3A1", bg=PANEL,
             font=("Segoe UI", 9), wraplength=220, justify="left"
         )
         self.status_label.pack(anchor="w", pady=(10, 0))
@@ -723,9 +1180,9 @@ class PixelCursorStudio:
     def _build_history_tab(self, tab):
         top = tk.Frame(tab, bg=PANEL)
         top.pack(fill="x", padx=4)
-        tk.Label(top, text="Yüklenen görseller ve\nuygulanan imleçler", fg=MUTED, bg=PANEL,
+        tk.Label(top, text=T("Yüklenen görseller ve\nuygulanan imleçler"), fg=MUTED, bg=PANEL,
                  font=("Segoe UI", 8), justify="left").pack(side="left")
-        tk.Button(top, text="Temizle", command=self.clear_history, bg="#45475A", fg=FG,
+        tk.Button(top, text=T("Temizle"), command=self.clear_history, bg="#45475A", fg=FG,
                   activebackground="#585B70", relief="flat", font=("Segoe UI", 8),
                   padx=6, pady=2).pack(side="right")
 
@@ -750,7 +1207,7 @@ class PixelCursorStudio:
 
     def _make_btn(self, parent, text, cmd, bg_color):
         btn = tk.Button(
-            parent, text=text, command=cmd, bg=bg_color, fg=FG,
+            parent, text=T(text), command=cmd, bg=bg_color, fg=FG,
             activebackground="#585B70", activeforeground="#FFFFFF",
             relief="flat", font=("Segoe UI", 9), pady=4, cursor="hand2"
         )
@@ -783,7 +1240,7 @@ class PixelCursorStudio:
         self.mini_canvas.configure(width=self.grid, height=self.grid)
         self.mini_canvas.create_image(0, 0, image=self.mini_image, anchor="nw")
         self.header_lbl.configure(
-            text=f"{self.grid}x{self.grid} PİKSEL TASARIM ALANI (Sol Tık: Çiz / Sağ Tık: Sil)")
+            text=T("{n}x{n} PİKSEL TASARIM ALANI (Sol Tık: Çiz / Sağ Tık: Sil)", n=self.grid))
         self.grid_var.set(self.grid)
 
     def change_grid_size(self, new_size: int):
@@ -797,7 +1254,7 @@ class PixelCursorStudio:
         self.grid = new_size
         self._build_canvas_cells()
         self.redraw_all()
-        self.status_label.configure(text=f"Tuval {new_size}x{new_size} olarak ayarlandı.")
+        self.status_label.configure(text=T("Tuval {n}x{n} olarak ayarlandı.", n=new_size))
 
     def set_color(self, hex_color: str):
         self.current_color = hex_color
@@ -807,7 +1264,7 @@ class PixelCursorStudio:
         self._schedule_save()
 
     def choose_custom_color(self):
-        color = colorchooser.askcolor(color=self.current_color, title="Renk Seç")
+        color = colorchooser.askcolor(color=self.current_color, title=T("Renk Seç"))
         if color and color[1]:
             self.set_color(color[1].upper())
 
@@ -818,7 +1275,7 @@ class PixelCursorStudio:
 
     def undo(self):
         if not self.undo_stack:
-            self.status_label.configure(text="Geri alınacak işlem yok.")
+            self.status_label.configure(text=T("Geri alınacak işlem yok."))
             return
         grid, pixels, hotspot = self.undo_stack.pop()
         self.pixels, self.hotspot = pixels, hotspot
@@ -826,13 +1283,13 @@ class PixelCursorStudio:
             self.grid = grid
             self._build_canvas_cells()
         self.redraw_all()
-        self.status_label.configure(text="Son işlem geri alındı.")
+        self.status_label.configure(text=T("Son işlem geri alındı."))
 
     def clear_canvas(self):
         self.save_undo_state()
         self.pixels = [[None] * self.grid for _ in range(self.grid)]
         self.redraw_all()
-        self.status_label.configure(text="Tuval temizlendi.")
+        self.status_label.configure(text=T("Tuval temizlendi."))
 
     def _get_cell_coords(self, event):
         x = event.x // self.cell
@@ -848,7 +1305,8 @@ class PixelCursorStudio:
         self._schedule_save()
 
     def _show_tool_hint(self):
-        self.hint_label.configure(text=TOOL_HINTS.get(self.current_tool.get(), ""))
+        hints = TOOL_HINTS_EN if LANG == "en" else TOOL_HINTS
+        self.hint_label.configure(text=hints.get(self.current_tool.get(), ""))
 
     def _paint_brush(self, x, y, color):
         """Fırça boyutunda kare boyar/siler (tıklanan nokta merkezde)."""
@@ -871,14 +1329,14 @@ class PixelCursorStudio:
             self.hotspot = [x, y]
             self._update_hotspot_visual()
             self._schedule_save()
-            self.status_label.configure(text=f"Tıklama noktası ({x}, {y}) olarak ayarlandı.")
+            self.status_label.configure(text=T("Tıklama noktası ({x}, {y}) olarak ayarlandı.", x=x, y=y))
             return
 
         if tool == "picker":
             picked = self.pixels[y][x]
             if picked:
                 self.set_color(picked)
-                self.status_label.configure(text=f"Renk seçildi: {picked}")
+                self.status_label.configure(text=T("Renk seçildi: {c}", c=picked))
             return
 
         if tool == "area":
@@ -892,7 +1350,7 @@ class PixelCursorStudio:
             self.save_undo_state()
             removed = erase_similar_region(self.pixels, [(x, y)], self.tolerance_var.get())
             self.redraw_all()
-            self.status_label.configure(text=f"Sihirli silgi: {removed} piksel silindi.")
+            self.status_label.configure(text=T("Sihirli silgi: {n} piksel silindi.", n=removed))
             return
 
         self.save_undo_state()
@@ -944,7 +1402,7 @@ class PixelCursorStudio:
                 self.pixels[y][x] = None
         self.redraw_all()
         self.status_label.configure(
-            text=f"Alan silindi: {abs(x1 - x0) + 1}x{abs(y1 - y0) + 1} piksel.")
+            text=T("Alan silindi: {w}x{h} piksel.", w=abs(x1 - x0) + 1, h=abs(y1 - y0) + 1))
 
     def remove_background(self):
         """Arka planı tek tıkla siler.
@@ -954,7 +1412,7 @@ class PixelCursorStudio:
         sığdırılır. Aksi halde tuvaldeki piksellerden kaldırılır.
         """
         if not self._has_pixels():
-            self.status_label.configure(text="Tuval zaten boş.")
+            self.status_label.configure(text=T("Tuval zaten boş."))
             return
         before = sum(1 for row in self.pixels for c in row if c)
         src = self._import_src
@@ -969,11 +1427,11 @@ class PixelCursorStudio:
             if encode_pixels(self.pixels) == src[2]:
                 self.undo_stack.pop()
                 self.status_label.configure(
-                    text="Kenarlara bağlı bir arka plan bulunamadı. Sihirli silgi veya Alan silgisini dene.")
+                    text=T("Kenarlara bağlı bir arka plan bulunamadı. Sihirli silgi veya Alan silgisini dene."))
                 return
             self.status_label.configure(
-                text="Arka plan orijinal görselden kaldırıldı ve nesne tuvale sığdırıldı. "
-                     "Fazla/az sildiyse Ctrl+Z yapıp Tolerans'ı değiştir.")
+                text=T("Arka plan orijinal görselden kaldırıldı ve nesne tuvale sığdırıldı. "
+                       "Fazla/az sildiyse Ctrl+Z yapıp Tolerans'ı değiştir."))
             return
 
         seeds = find_background_seeds(self.pixels, self.tolerance_var.get())
@@ -982,12 +1440,12 @@ class PixelCursorStudio:
         if removed == 0:
             self.undo_stack.pop()
             self.status_label.configure(
-                text="Kenarlara bağlı bir arka plan bulunamadı. Sihirli silgi veya Alan silgisini dene.")
+                text=T("Kenarlara bağlı bir arka plan bulunamadı. Sihirli silgi veya Alan silgisini dene."))
             return
         self.redraw_all()
         self.status_label.configure(
-            text=f"Arka plan kaldırıldı ({removed} / {before} piksel). "
-                 "Fazla/az sildiyse Ctrl+Z yapıp Tolerans'ı değiştir.")
+            text=T("Arka plan kaldırıldı ({n} / {total} piksel). "
+                   "Fazla/az sildiyse Ctrl+Z yapıp Tolerans'ı değiştir.", n=removed, total=before))
 
     def on_right_down(self, event):
         x, y = self._get_cell_coords(event)
@@ -1037,7 +1495,7 @@ class PixelCursorStudio:
                            (hx + 1) * self.cell - pad, (hy + 1) * self.cell - pad)
         self.canvas.tag_raise(self.hotspot_marker)
         self.hotspot_label.configure(
-            text=f"Boyut: {self.grid}x{self.grid}\nHotspot: ({hx}, {hy})")
+            text=T("Boyut: {n}x{n}\nHotspot: ({x}, {y})", n=self.grid, x=hx, y=hy))
 
     def _update_mini_preview(self):
         rows = []
@@ -1060,20 +1518,20 @@ class PixelCursorStudio:
     # ------------------------------------------------------ GÖRSEL YÜKLE --
     def import_image(self):
         file_path = filedialog.askopenfilename(
-            title="İmleç İçin Görsel Seç",
-            filetypes=[("Görsel Dosyaları", "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.ico"),
-                       ("Tüm Dosyalar", "*.*")]
+            title=T("İmleç İçin Görsel Seç"),
+            filetypes=[(T("Görsel Dosyaları"), "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.ico"),
+                       (T("Tüm Dosyalar"), "*.*")]
         )
         if not file_path:
             return
         if Image is None:
-            self.status_label.configure(text="Görsel desteği hazırlanıyor (Pillow), lütfen bekleyin...")
+            self.status_label.configure(text=T("Görsel desteği hazırlanıyor (Pillow), lütfen bekleyin..."))
             self.root.update_idletasks()
         if load_pillow() is None:
             messagebox.showerror(
-                "Pillow Bulunamadı",
-                "Görsel yüklemek için gereken Pillow kütüphanesi kurulamadı.\n"
-                "İnternet bağlantınızı kontrol edip tekrar deneyin."
+                T("Pillow Bulunamadı"),
+                T("Görsel yüklemek için gereken Pillow kütüphanesi kurulamadı.\n"
+                  "İnternet bağlantınızı kontrol edip tekrar deneyin.")
             )
             return
         try:
@@ -1081,13 +1539,14 @@ class PixelCursorStudio:
             self._place_image(file_path, self.auto_bg_var.get())
             name = os.path.basename(file_path)
             self.add_history("Görsel", name)
-            extra = " Arka plan kaldırıldı." if self.auto_bg_var.get() else ""
+            extra = T(" Arka plan kaldırıldı.") if self.auto_bg_var.get() else ""
             self.status_label.configure(
-                text=f"'{name}' {self.grid}x{self.grid} piksel olarak aktarıldı ve geçmişe eklendi.{extra}")
+                text=T("'{name}' {n}x{n} piksel olarak aktarıldı ve geçmişe eklendi.{extra}",
+                       name=name, n=self.grid, extra=extra))
         except Exception as e:
             if self.undo_stack:
                 self.undo_stack.pop()
-            messagebox.showerror("Görsel Hatası", f"Görsel yüklenemedi:\n{e}")
+            messagebox.showerror(T("Görsel Hatası"), T("Görsel yüklenemedi:\n{e}", e=e))
 
     def _place_image(self, file_path: str, remove_bg: bool):
         """Görseli açar, (istenirse) arka planını kaldırır, kırpar, ızgaraya sığdırıp ortalar."""
@@ -1158,9 +1617,9 @@ class PixelCursorStudio:
 
     def export_cur_dialog(self):
         file_path = filedialog.asksaveasfilename(
-            title="İmleci Kaydet",
+            title=T("İmleci Kaydet"),
             defaultextension=".cur",
-            filetypes=[("Windows İmleç Dosyası", "*.cur")]
+            filetypes=[(T("Windows İmleç Dosyası"), "*.cur")]
         )
         if not file_path:
             return
@@ -1168,9 +1627,9 @@ class PixelCursorStudio:
             with open(file_path, "wb") as f:
                 f.write(self.build_cur_bytes())
             self.add_history("Kaydedildi", os.path.basename(file_path))
-            self.status_label.configure(text=f"Kaydedildi: {os.path.basename(file_path)}")
+            self.status_label.configure(text=T("Kaydedildi: {name}", name=os.path.basename(file_path)))
         except Exception as e:
-            messagebox.showerror("Kayıt Hatası", f"Dosya kaydedilemedi:\n{e}")
+            messagebox.showerror(T("Kayıt Hatası"), T("Dosya kaydedilemedi:\n{e}", e=e))
 
     # ------------------------------------------------- SİSTEME UYGULA --
     def _target_ids(self):
@@ -1192,10 +1651,10 @@ class PixelCursorStudio:
 
     def apply_cursor_to_system(self):
         if sys.platform != "win32":
-            messagebox.showwarning("Platform Uyarısı", "Sistem imleci değiştirme yalnızca Windows'ta çalışır.")
+            messagebox.showwarning(T("Platform Uyarısı"), T("Sistem imleci değiştirme yalnızca Windows'ta çalışır."))
             return
         if not self._has_pixels():
-            messagebox.showwarning("Uyarı", "Tamamen boş bir imleç uygulayamazsınız! Lütfen önce çizim yapın.")
+            messagebox.showwarning(T("Uyarı"), T("Tamamen boş bir imleç uygulayamazsınız! Lütfen önce çizim yapın."))
             return
 
         cur_bytes = self.build_cur_bytes()
@@ -1230,7 +1689,7 @@ class PixelCursorStudio:
             self._save_now()
             self.add_history("Uygulandı", self._mode_label())
             self.status_label.configure(
-                text="İmleç uygulandı ve kalıcı olarak kaydedildi. Bilgisayar yeniden başlasa da kalacak.")
+                text=T("İmleç uygulandı ve kalıcı olarak kaydedildi. Bilgisayar yeniden başlasa da kalacak."))
         except Exception as e:
             # Kayıt defterine yazılamazsa eski (geçici) yöntemle en azından şimdilik uygula
             try:
@@ -1245,9 +1704,9 @@ class PixelCursorStudio:
                     if hcursor:
                         user32.SetSystemCursor(hcursor, cid)
                 self.status_label.configure(
-                    text=f"İmleç uygulandı ama kalıcı kaydedilemedi ({e}). Yeniden başlatınca sıfırlanabilir.")
+                    text=T("İmleç uygulandı ama kalıcı kaydedilemedi ({e}). Yeniden başlatınca sıfırlanabilir.", e=e))
             except Exception as e2:
-                messagebox.showerror("Sistem Hatası", f"İmleç uygulanırken hata oluştu:\n{e2}")
+                messagebox.showerror(T("Sistem Hatası"), T("İmleç uygulanırken hata oluştu:\n{e}", e=e2))
 
     def _mode_label(self):
         return {"normal": "Standart ok", "hand": "El imleci", "cross": "Nişangah",
@@ -1272,9 +1731,9 @@ class PixelCursorStudio:
                     os.remove(os.path.join(cursor_dir, f))
                 except OSError:
                     pass
-            self.status_label.configure(text="Varsayılan Windows imleci geri yüklendi.")
+            self.status_label.configure(text=T("Varsayılan Windows imleci geri yüklendi."))
         except Exception as e:
-            messagebox.showerror("Sistem Hatası", f"Varsayılan imleç geri yüklenemedi:\n{e}")
+            messagebox.showerror(T("Sistem Hatası"), T("Varsayılan imleç geri yüklenemedi:\n{e}", e=e))
 
     # ------------------------------------------- KAYIT / OTURUM --
     def _schedule_save(self):
@@ -1283,6 +1742,11 @@ class PixelCursorStudio:
         self._save_job = self.root.after(1500, self._save_now)
 
     def _save_now(self):
+        if self._save_job is not None:
+            try:
+                self.root.after_cancel(self._save_job)
+            except tk.TclError:
+                pass
         self._save_job = None
         self.settings.update({
             "version": 2,
@@ -1291,7 +1755,8 @@ class PixelCursorStudio:
             "hotspot": self.hotspot,
             "color": self.current_color,
             "target_mode": self.target_cursor_mode.get(),
-            "screen_size": self.screen_size.get(),
+            "screen_size": self.screen_size.get() if self.screen_size.get().isdigit() else "",
+            "lang": LANG,
             "brush": self.brush_var.get(),
             "tolerance": self.tolerance_var.get(),
             "auto_bg": self.auto_bg_var.get(),
@@ -1311,12 +1776,17 @@ class PixelCursorStudio:
             self.hotspot = [min(hx, self.grid - 1), min(hy, self.grid - 1)]
             self.color_preview.configure(bg=self.current_color)
             self.redraw_all()
-            self.status_label.configure(text="Son çalışman geri yüklendi.")
+            self.status_label.configure(text=T("Son çalışman geri yüklendi."))
             return True
         except Exception:
             return False
 
     def on_close(self):
+        if getattr(self, "_poll_job", None) is not None:
+            try:
+                self.root.after_cancel(self._poll_job)
+            except tk.TclError:
+                pass
         if self._save_job is not None:
             self.root.after_cancel(self._save_job)
         self._save_now()
@@ -1349,7 +1819,7 @@ class PixelCursorStudio:
     def clear_history(self):
         if not self.history:
             return
-        if messagebox.askyesno("Geçmişi Temizle", "Tüm geçmiş silinsin mi?"):
+        if messagebox.askyesno(T("Geçmişi Temizle"), T("Tüm geçmiş silinsin mi?")):
             self.history = []
             self._save_history()
             self._render_history()
@@ -1367,8 +1837,8 @@ class PixelCursorStudio:
             w.destroy()
         self._history_images = []
         if not self.history:
-            tk.Label(self.hist_inner, text="Henüz geçmiş yok.\nGörsel yüklediğinde veya imleç\n"
-                                            "uyguladığında burada görünür.",
+            tk.Label(self.hist_inner, text=T("Henüz geçmiş yok.\nGörsel yüklediğinde veya imleç\n"
+                                              "uyguladığında burada görünür."),
                      fg=MUTED, bg=PANEL, font=("Segoe UI", 9), justify="left").pack(anchor="w", pady=8, padx=4)
             return
         kind_colors = {"Görsel": "#89B4FA", "Uygulandı": "#00F5D4", "Kaydedildi": "#F9E2AF"}
@@ -1381,9 +1851,9 @@ class PixelCursorStudio:
             card = tk.Frame(self.hist_inner, bg="#11111B", padx=6, pady=6)
             card.pack(fill="x", pady=3, padx=2)
             tk.Label(card, image=thumb, bg="#11111B").grid(row=0, column=0, rowspan=3, padx=(0, 8))
-            tk.Label(card, text=entry.get("kind", ""), fg=kind_colors.get(entry.get("kind"), FG),
+            tk.Label(card, text=T(entry.get("kind", "")), fg=kind_colors.get(entry.get("kind"), FG),
                      bg="#11111B", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w")
-            name = entry.get("name", "")
+            name = T(entry.get("name", ""))
             if len(name) > 20:
                 name = name[:19] + "…"
             tk.Label(card, text=f"{name}\n{entry.get('time', '')} · {entry['grid']}px",
@@ -1394,7 +1864,7 @@ class PixelCursorStudio:
             for text, cmd, color in (("Aç", lambda i=idx: self.load_history(i), BTN),
                                      ("Uygula", lambda i=idx: self.load_history(i, apply=True), "#00F5D4"),
                                      ("Sil", lambda i=idx: self.delete_history(i), "#45475A")):
-                tk.Button(btns, text=text, command=cmd, bg=color,
+                tk.Button(btns, text=T(text), command=cmd, bg=color,
                           fg="#11111B" if color == "#00F5D4" else FG,
                           relief="flat", font=("Segoe UI", 8), padx=6, pady=1,
                           cursor="hand2").pack(side="left", padx=(0, 4))
@@ -1408,7 +1878,8 @@ class PixelCursorStudio:
             self.grid = entry["grid"]
             self._build_canvas_cells()
         self.redraw_all()
-        self.status_label.configure(text=f"Geçmişten açıldı: {entry.get('name') or entry.get('kind')}")
+        self.status_label.configure(
+            text=T("Geçmişten açıldı: {name}", name=T(entry.get("name") or entry.get("kind", ""))))
         if apply:
             self.notebook.select(0)
             self.apply_cursor_to_system()
@@ -1464,6 +1935,15 @@ class PixelCursorStudio:
 
 
 if __name__ == "__main__":
+    # Derleme betiğinin kullandığı komutlar (arayüz açmadan çalışır)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--bump-version":
+        print(bump_version_in_file(os.path.abspath(__file__), sys.argv[2] if len(sys.argv) > 2 else ""))
+        sys.exit(0)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--make-version-json":
+        folder = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(os.path.abspath(__file__))
+        print(json.dumps(make_version_json(folder), indent=2))
+        sys.exit(0)
+
     _hide_own_console()
     root = tk.Tk()
     apply_window_icon(root)

@@ -37,6 +37,10 @@
 - **Geçmiş sekmesi:** yüklenen görseller, kaydedilen ve uygulanan imleçler küçük
   önizlemeleriyle listelenir; tek tıkla açılır veya uygulanır
 - Geri al (Ctrl+Z)
+- **Türkçe / İngilizce arayüz:** sağ üstteki **TR / EN** ile anında değişir
+- **Uygulama içinden güncelleme:** sağ üstteki **Güncellemeleri denetle** düğmesi yeni sürüm
+  varsa sorar, indirir, doğrular ve uygulamayı kendiliğinden günceller. Yeni sürüm
+  yayınlandığında düğme sarıya döner; tekrar indirmeye gerek kalmaz.
 
 Ayarlar ve geçmiş `%APPDATA%\PixelCursorStudio` klasöründe tutulur.
 
@@ -45,10 +49,14 @@ Ayarlar ve geçmiş `%APPDATA%\PixelCursorStudio` klasöründe tutulur.
 Python 3 kuruluysa `PixelCursor.pyw` dosyasına çift tıklaman yeterli. Komut penceresi açılmaz;
 Pillow eksikse arka planda sessizce kurulur.
 
-### EXE'yi kendin derlemek
+### Yeni sürüm yayınlamak (geliştirici için)
 
-Python kurulu bir Windows bilgisayarda `EXE_Olustur.bat` dosyasına çift tıkla.
-PyInstaller kurulur ve aynı klasörde `PixelCursor.exe` oluşturulur.
+1. `PixelCursor.pyw` üzerinde değişikliklerini yap.
+2. Python kurulu bir Windows bilgisayarda `EXE_Olustur.bat` dosyasına çift tıkla.
+   Sürüm numarasını sorar (Enter = otomatik bir artırır), `PixelCursor.exe`'yi derler
+   ve `version.json` güncelleme bilgisini oluşturur.
+3. GitHub Desktop'ta **Commit** + **Push** yap. Kullanıcılar uygulamadaki
+   **Güncellemeleri denetle** düğmesiyle yeni sürüme geçer.
 
 ### Lisans
 
@@ -87,18 +95,26 @@ A small desktop app for drawing 32x32, 48x48 or 64x64 pixel-art mouse cursors an
 - **History tab:** imported images, saved and applied cursors are listed with small
   previews; open or apply any of them with one click
 - Undo (Ctrl+Z)
+- **Turkish / English interface:** switch instantly with **TR / EN** in the top right
+- **In-app updates:** the **Check for updates** button in the top right asks if a new version
+  is available, downloads it, verifies it and updates the app by itself. When a new version
+  is released the button turns yellow, so there's no need to download it again manually.
 
-> The app interface is in Turkish. Settings and history are stored in `%APPDATA%\PixelCursorStudio`.
+> Settings and history are stored in `%APPDATA%\PixelCursorStudio`.
 
 ### Run from source
 
 If Python 3 is installed, just double-click `PixelCursor.pyw`. No console window opens;
 Pillow is installed silently in the background if it's missing.
 
-### Build the EXE yourself
+### Releasing a new version (for developers)
 
-On a Windows PC with Python installed, double-click `EXE_Olustur.bat`.
-It installs PyInstaller and creates `PixelCursor.exe` in the same folder.
+1. Make your changes in `PixelCursor.pyw`.
+2. On a Windows PC with Python installed, double-click `EXE_Olustur.bat`.
+   It asks for the version number (Enter = bump automatically), builds `PixelCursor.exe`
+   and creates the `version.json` update info.
+3. **Commit** + **Push** in GitHub Desktop. Users move to the new version with the
+   **Check for updates** button in the app.
 
 ### License
 

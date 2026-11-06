@@ -13,6 +13,11 @@
 #   - GEÇMİŞ sekmesi: yüklenen görseller, kaydedilen ve uygulanan imleçler
 #   - Uygulanan imleç kayıt defterine yazılır; bilgisayar yeniden başlasa da kalır
 #   - 32x32 / 48x48 / 64x64 tuval; görseller oran korunarak ve kırpılarak aktarılır
+#
+# SÜRÜM 3:
+#   - Yüklerken arka planı otomatik kaldırma + "Arka Planı Kaldır" düğmesi
+#   - Sihirli silgi (benzer renkli bölgeyi siler), Alan silgisi (dikdörtgen)
+#   - Fırça boyutu (1/2/3/5) ve Tolerans ayarı
 #   Veriler: %APPDATA%\PixelCursorStudio
 # ============================================================================
 
@@ -159,6 +164,18 @@ ROLE_NAMES = {OCR_NORMAL: "Arrow", OCR_HAND: "Hand", OCR_CROSS: "Crosshair", OCR
 GRID_CHOICES = (32, 48, 64)
 CANVAS_PX = 512          # Çizim alanının ekrandaki boyutu (piksel)
 HISTORY_LIMIT = 40
+BRUSH_CHOICES = (1, 2, 3, 5)
+MAX_COLOR_DIST = 441.68  # sqrt(3 * 255^2): iki renk arasındaki en büyük fark
+
+TOOL_HINTS = {
+    "pencil": "Kalem: sol tıkla çiz. Sağ tık her araçta siler.",
+    "eraser": "Silgi: fırça boyutunda siler.",
+    "fill": "Boya kovası: aynı renkli bölgeyi doldurur.",
+    "picker": "Renk seçici: tıkladığın pikselin rengini alır.",
+    "magic": "Sihirli silgi: tıkladığın renge benzeyen bitişik bölgeyi tek seferde siler (Tolerans ayarına bakar).",
+    "area": "Alan silgisi: sürükleyerek bir dikdörtgen çiz, içi silinir.",
+    "hotspot": "Tıklama noktası: imlecin tıklayan ucunu seç.",
+}
 
 BG = "#181825"
 PANEL = "#1E1E2E"
@@ -204,6 +221,136 @@ def decode_pixels(text: str, size: int):
             row.append(None if (not chunk or chunk == "------") else "#" + chunk.upper())
         out.append(row)
     return out
+
+
+def hex_to_rgb(hex_str: str):
+    h = hex_str.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def tolerance_to_dist(tolerance: float) -> float:
+    return max(0.0, min(100.0, tolerance)) / 100.0 * MAX_COLOR_DIST
+
+
+def _close(a, b, limit_sq):
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2 <= limit_sq
+
+
+def erase_similar_region(pixels, seeds, tolerance: float) -> int:
+    """seeds noktalarından başlayıp her tohumun rengine benzeyen BİTİŞİK pikselleri siler.
+
+    Şeffaf (None) pikseller geçilebilir ama referans rengi olmadığı için
+    yalnızca renkli bir tohumdan gelen yayılma renkli piksel siler.
+    Silinen piksel sayısını döndürür.
+    """
+    n = len(pixels)
+    limit_sq = tolerance_to_dist(tolerance) ** 2
+    queue = deque()
+    seen = set()
+    for (x, y) in seeds:
+        if (x, y) in seen:
+            continue
+        seen.add((x, y))
+        c = pixels[y][x]
+        queue.append((x, y, hex_to_rgb(c) if c else None))
+    removed = 0
+    while queue:
+        x, y, ref = queue.popleft()
+        c = pixels[y][x]
+        if c is not None:
+            if ref is None or not _close(hex_to_rgb(c), ref, limit_sq):
+                continue
+            pixels[y][x] = None
+            removed += 1
+        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if 0 <= nx < n and 0 <= ny < n and (nx, ny) not in seen:
+                seen.add((nx, ny))
+                queue.append((nx, ny, ref))
+    return removed
+
+
+def find_background_seeds(pixels, tolerance: float):
+    """Çizimin dış çerçevesinde (dolu piksellerin sınır kutusu) baskın bir arka plan
+    rengi arar. Çerçevenin çoğu doluysa ve tek bir renk baskınsa o pikselleri döndürür;
+    zaten şeffaf arka planlı çizimlerde (ör. ok imleci) boş liste döner, böylece
+    çizimin kendisi silinmez.
+    """
+    n = len(pixels)
+    filled = [(x, y) for y in range(n) for x in range(n) if pixels[y][x]]
+    if not filled:
+        return []
+    x0 = min(p[0] for p in filled); x1 = max(p[0] for p in filled)
+    y0 = min(p[1] for p in filled); y1 = max(p[1] for p in filled)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return []
+    perim = [(x, y0) for x in range(x0, x1 + 1)] + [(x, y1) for x in range(x0, x1 + 1)]
+    perim += [(x0, y) for y in range(y0 + 1, y1)] + [(x1, y) for y in range(y0 + 1, y1)]
+    on = [(x, y) for (x, y) in perim if pixels[y][x]]
+    if len(on) < 0.7 * len(perim):
+        return []
+    limit_sq = tolerance_to_dist(tolerance) ** 2
+    rgbs = [hex_to_rgb(pixels[y][x]) for (x, y) in on]
+    best, best_count = None, 0
+    for cand in rgbs[::max(1, len(rgbs) // 64)]:
+        count = sum(1 for c in rgbs if _close(c, cand, limit_sq))
+        if count > best_count:
+            best, best_count = cand, count
+    if best_count < 0.5 * len(on):
+        return []
+    return [p for p, c in zip(on, rgbs) if _close(c, best, limit_sq)]
+
+
+def edge_cells(n: int):
+    cells = [(x, 0) for x in range(n)] + [(x, n - 1) for x in range(n)]
+    cells += [(0, y) for y in range(1, n - 1)] + [(n - 1, y) for y in range(1, n - 1)]
+    return cells
+
+
+def remove_image_background(img, tolerance: float, max_side: int = 320):
+    """Pillow RGBA görselinin kenarlardan başlayan düz/benzer renkli arka planını şeffaf yapar.
+
+    Hız için önce görsel en fazla max_side piksele küçültülür (tuval zaten en fazla 64 px).
+    """
+    w, h = img.size
+    if max(w, h) > max_side:
+        scale = max_side / max(w, h)
+        img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.Resampling.LANCZOS)
+        w, h = img.size
+    px = img.load()
+    limit_sq = tolerance_to_dist(tolerance) ** 2
+    queue = deque()
+    seen = bytearray(w * h)
+    for x in range(w):
+        for y in (0, h - 1):
+            if not seen[y * w + x]:
+                seen[y * w + x] = 1
+                queue.append((x, y))
+    for y in range(h):
+        for x in (0, w - 1):
+            if not seen[y * w + x]:
+                seen[y * w + x] = 1
+                queue.append((x, y))
+    # Her kenar pikseli kendi rengini referans alır (degrade arka planlar için)
+    refs = {}
+    for (x, y) in queue:
+        r, g, b, a = px[x, y]
+        refs[(x, y)] = None if a < 32 else (r, g, b)
+    queue = deque((x, y, refs[(x, y)]) for (x, y) in queue)
+    while queue:
+        x, y, ref = queue.popleft()
+        r, g, b, a = px[x, y]
+        if a >= 32:
+            if ref is None:
+                ref = (r, g, b)  # şeffaf kenardan gelinen ilk opak piksel: dur
+                continue
+            if not _close((r, g, b), ref, limit_sq):
+                continue
+        px[x, y] = (r, g, b, 0)
+        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if 0 <= nx < w and 0 <= ny < h and not seen[ny * w + nx]:
+                seen[ny * w + nx] = 1
+                queue.append((nx, ny, ref))
+    return img
 
 
 def resample_pixels(pixels, new_size: int):
@@ -275,6 +422,12 @@ class PixelCursorStudio:
         self.target_cursor_mode = tk.StringVar(value=self.settings.get("target_mode", "normal"))
         self.screen_size = tk.StringVar(value=self.settings.get("screen_size", "Windows ayarı"))
         self.grid_var = tk.IntVar(value=self.grid)
+        brush = self.settings.get("brush", 1)
+        self.brush_var = tk.IntVar(value=brush if brush in BRUSH_CHOICES else 1)
+        self.tolerance_var = tk.IntVar(value=int(self.settings.get("tolerance", 15)))
+        self.auto_bg_var = tk.BooleanVar(value=bool(self.settings.get("auto_bg", True)))
+        self._area_start = None
+        self._import_src = None  # (dosya yolu, ızgara, pikseller) - son yüklenen görsel
         self.hotspot = [0, 0]  # [x, y]
         self._save_job = None
         self._history_images = []
@@ -299,6 +452,7 @@ class PixelCursorStudio:
         self.root.bind("<Control-z>", lambda e: self.undo())
         self.root.bind("<Control-Z>", lambda e: self.undo())
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.current_tool.trace_add("write", lambda *_: self._show_tool_hint())
 
     # ------------------------------------------------------------------ UI --
     def _setup_styles(self):
@@ -318,6 +472,8 @@ class PixelCursorStudio:
                         bordercolor=PANEL, arrowcolor=FG, lightcolor=BTN, darkcolor=BTN,
                         gripcount=0)
         style.map("Dark.Vertical.TScrollbar", background=[("active", "#45475A")])
+        style.configure("Dark.Horizontal.TScale", background="#00F5D4", troughcolor=BTN,
+                        bordercolor=PANEL, lightcolor="#00F5D4", darkcolor="#00F5D4")
         style.configure("Dark.TCombobox", fieldbackground=BTN, background=BTN,
                         foreground=FG, arrowcolor=FG, bordercolor="#45475A",
                         lightcolor=BTN, darkcolor=BTN)
@@ -346,28 +502,62 @@ class PixelCursorStudio:
 
         self._section(left_panel, "ARAÇLAR", top=0)
         tools = [
-            ("Kalem (Sol Tık)", "pencil"),
-            ("Silgi (Sağ Tık)", "eraser"),
+            ("Kalem", "pencil"),
+            ("Silgi", "eraser"),
             ("Boya Kovası", "fill"),
-            ("Renk Seçici (Damla)", "picker"),
+            ("Renk Seçici", "picker"),
+            ("Sihirli Silgi", "magic"),
+            ("Alan Silgisi", "area"),
             ("Tıklama Noktası (Hotspot)", "hotspot"),
         ]
-        for text, val in tools:
+        tool_grid = tk.Frame(left_panel, bg=PANEL)
+        tool_grid.pack(fill="x")
+        for idx, (text, val) in enumerate(tools):
+            last = idx == len(tools) - 1
             tk.Radiobutton(
-                left_panel, text=text, variable=self.current_tool, value=val,
-                bg=PANEL, fg=FG, selectcolor=BTN,
+                tool_grid, text=text, variable=self.current_tool, value=val,
+                bg=BTN if val in ("magic", "area") else PANEL, fg=FG, selectcolor="#45475A",
                 activebackground=PANEL, activeforeground="#89B4FA",
-                font=("Segoe UI", 9), anchor="w", indicatoron=False,
-                width=22, pady=4, bd=0, highlightthickness=0
-            ).pack(pady=2)
+                font=("Segoe UI", 9), indicatoron=False,
+                pady=4, bd=0, highlightthickness=0
+            ).grid(row=idx // 2, column=idx % 2, columnspan=2 if last else 1,
+                   sticky="ew", padx=2, pady=2)
+        tool_grid.columnconfigure(0, weight=1, uniform="t")
+        tool_grid.columnconfigure(1, weight=1, uniform="t")
+
+        brush_row = tk.Frame(left_panel, bg=PANEL)
+        brush_row.pack(fill="x", pady=(6, 0))
+        tk.Label(brush_row, text="Fırça:", fg=MUTED, bg=PANEL,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(2, 6))
+        for b in BRUSH_CHOICES:
+            tk.Radiobutton(
+                brush_row, text=str(b), variable=self.brush_var, value=b,
+                command=self._schedule_save,
+                bg=PANEL, fg=FG, selectcolor="#00F5D4", activebackground=PANEL,
+                font=("Segoe UI", 9, "bold"), indicatoron=False, width=3, pady=2,
+                bd=0, highlightthickness=0
+            ).pack(side="left", padx=2, expand=True, fill="x")
+
+        tol_row = tk.Frame(left_panel, bg=PANEL)
+        tol_row.pack(fill="x", pady=(4, 0))
+        tk.Label(tol_row, text="Tolerans:", fg=MUTED, bg=PANEL,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(2, 0), anchor="s", pady=(0, 2))
+        self.tol_value_lbl = tk.Label(tol_row, text=str(self.tolerance_var.get()), fg=FG, bg=PANEL,
+                                      font=("Consolas", 9, "bold"), width=3)
+        self.tol_value_lbl.pack(side="right")
+        ttk.Scale(
+            tol_row, from_=0, to=100, orient="horizontal", style="Dark.Horizontal.TScale",
+            command=self._on_tolerance
+        ).pack(side="left", fill="x", expand=True, padx=(6, 4))
+        tol_row.winfo_children()[-1].set(self.tolerance_var.get())
 
         tk.Checkbutton(
             left_panel, text="Izgarayı Göster", variable=self.show_grid,
             command=self._refresh_canvas_grid, bg=PANEL, fg=MUTED,
             selectcolor=BTN, activebackground=PANEL, font=("Segoe UI", 9)
-        ).pack(anchor="w", pady=(6, 0))
+        ).pack(anchor="w", pady=(2, 0))
 
-        self._section(left_panel, "TUVAL BOYUTU", top=8)
+        self._section(left_panel, "TUVAL BOYUTU", top=6)
         size_row = tk.Frame(left_panel, bg=PANEL)
         size_row.pack(fill="x")
         for n in GRID_CHOICES:
@@ -379,7 +569,7 @@ class PixelCursorStudio:
                 bd=0, highlightthickness=0
             ).pack(side="left", padx=2, expand=True, fill="x")
 
-        self._section(left_panel, "AKTİF RENK", top=10)
+        self._section(left_panel, "AKTİF RENK", top=8)
         color_row = tk.Frame(left_panel, bg=PANEL)
         color_row.pack(fill="x", pady=2)
         self.color_preview = tk.Frame(
@@ -394,21 +584,38 @@ class PixelCursorStudio:
         ).pack(side="left", fill="x", expand=True)
 
         palette_frame = tk.Frame(left_panel, bg=PANEL)
-        palette_frame.pack(pady=6)
+        palette_frame.pack(pady=4)
         for idx, hex_col in enumerate(self.palette):
             tk.Button(
                 palette_frame, bg=hex_col, activebackground=hex_col, width=3, height=1,
                 relief="flat", command=lambda c=hex_col: self.set_color(c)
             ).grid(row=idx // 4, column=idx % 4, padx=2, pady=2)
 
-        self._section(left_panel, "TUVAL İŞLEMLERİ", top=8)
-        self._make_btn(left_panel, "Geri Al (Ctrl+Z)", self.undo, BTN)
-        self._make_btn(left_panel, "Tuvali Temizle", self.clear_canvas, "#45475A")
+        self._section(left_panel, "TUVAL İŞLEMLERİ", top=6)
+        tk.Button(
+            left_panel, text="Arka Planı Kaldır", command=self.remove_background,
+            bg="#9B5DE5", fg="#FFFFFF", activebackground="#B07CF0", activeforeground="#FFFFFF",
+            font=("Segoe UI", 9, "bold"), relief="flat", pady=5, cursor="hand2"
+        ).pack(fill="x", pady=2)
+        ops_row = tk.Frame(left_panel, bg=PANEL)
+        ops_row.pack(fill="x")
+        for text, cmd, color in (("Geri Al (Ctrl+Z)", self.undo, BTN),
+                                 ("Temizle", self.clear_canvas, "#45475A")):
+            tk.Button(ops_row, text=text, command=cmd, bg=color, fg=FG,
+                      activebackground="#585B70", activeforeground="#FFFFFF",
+                      relief="flat", font=("Segoe UI", 9), pady=4, cursor="hand2"
+                      ).pack(side="left", fill="x", expand=True, padx=(0, 2) if cmd == self.undo else (2, 0), pady=2)
 
-        self._section(left_panel, "HAZIR ŞABLONLAR", top=10)
-        self._make_btn(left_panel, "Neon Piksel Ok", self._load_template_arrow, BTN)
-        self._make_btn(left_panel, "RPG Piksel Kılıç", self._load_template_sword, BTN)
-        self._make_btn(left_panel, "FPS Nişangah", self._load_template_crosshair, BTN)
+        self._section(left_panel, "HAZIR ŞABLONLAR", top=6)
+        tpl_row = tk.Frame(left_panel, bg=PANEL)
+        tpl_row.pack(fill="x")
+        for text, cmd in (("Neon Ok", self._load_template_arrow),
+                          ("Kılıç", self._load_template_sword),
+                          ("Nişangah", self._load_template_crosshair)):
+            tk.Button(tpl_row, text=text, command=cmd, bg=BTN, fg=FG,
+                      activebackground="#585B70", activeforeground="#FFFFFF",
+                      relief="flat", font=("Segoe UI", 9), pady=4, cursor="hand2"
+                      ).pack(side="left", fill="x", expand=True, padx=1, pady=2)
 
         # ORTA PANEL: Piksel Tuvali
         center_panel = tk.Frame(main_frame, bg=BG)
@@ -424,8 +631,12 @@ class PixelCursorStudio:
         self.canvas.pack()
         self.canvas.bind("<ButtonPress-1>", self.on_left_down)
         self.canvas.bind("<B1-Motion>", self.on_left_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_left_up)
         self.canvas.bind("<ButtonPress-3>", self.on_right_down)
         self.canvas.bind("<B3-Motion>", self.on_right_drag)
+        self.hint_label = tk.Label(center_panel, text=TOOL_HINTS["pencil"], fg=MUTED, bg=BG,
+                                   font=("Segoe UI", 9), wraplength=CANVAS_PX, justify="center")
+        self.hint_label.pack(pady=(8, 0))
 
         # SAĞ PANEL: Sekmeler (İmleç / Geçmiş)
         right_panel = tk.Frame(main_frame, bg=PANEL, padx=10, pady=10)
@@ -459,6 +670,11 @@ class PixelCursorStudio:
 
         self._section(tab, "DOSYA İŞLEMLERİ", top=4)
         self._make_btn(tab, "Görsel Yükle (PNG/JPG/GIF)", self.import_image, BTN)
+        tk.Checkbutton(
+            tab, text="Yüklerken arka planı otomatik kaldır", variable=self.auto_bg_var,
+            command=self._schedule_save, bg=PANEL, fg=FG, selectcolor=BTN,
+            activebackground=PANEL, font=("Segoe UI", 8)
+        ).pack(anchor="w", pady=(0, 2))
         self._make_btn(tab, ".CUR Olarak Kaydet", self.export_cur_dialog, BTN)
 
         self._section(tab, "BİLGİSAYARA UYGULA", top=12)
@@ -625,6 +841,25 @@ class PixelCursorStudio:
             return x, y
         return None, None
 
+    def _on_tolerance(self, value):
+        v = int(round(float(value)))
+        self.tolerance_var.set(v)
+        self.tol_value_lbl.configure(text=str(v))
+        self._schedule_save()
+
+    def _show_tool_hint(self):
+        self.hint_label.configure(text=TOOL_HINTS.get(self.current_tool.get(), ""))
+
+    def _paint_brush(self, x, y, color):
+        """Fırça boyutunda kare boyar/siler (tıklanan nokta merkezde)."""
+        size = self.brush_var.get()
+        start = -(size // 2)
+        for dy in range(start, start + size):
+            for dx in range(start, start + size):
+                px, py = x + dx, y + dy
+                if 0 <= px < self.grid and 0 <= py < self.grid:
+                    self._set_pixel(px, py, color)
+
     def on_left_down(self, event):
         x, y = self._get_cell_coords(event)
         if x is None:
@@ -646,36 +881,125 @@ class PixelCursorStudio:
                 self.status_label.configure(text=f"Renk seçildi: {picked}")
             return
 
+        if tool == "area":
+            self._area_start = (x, y)
+            self._draw_area_rect(x, y)
+            return
+
+        if tool == "magic":
+            if self.pixels[y][x] is None:
+                return
+            self.save_undo_state()
+            removed = erase_similar_region(self.pixels, [(x, y)], self.tolerance_var.get())
+            self.redraw_all()
+            self.status_label.configure(text=f"Sihirli silgi: {removed} piksel silindi.")
+            return
+
         self.save_undo_state()
         if tool == "fill":
             self.flood_fill(x, y, self.current_color)
             self.redraw_all()
         elif tool == "eraser":
-            self._set_pixel(x, y, None)
+            self._paint_brush(x, y, None)
         else:
-            self._set_pixel(x, y, self.current_color)
+            self._paint_brush(x, y, self.current_color)
 
     def on_left_drag(self, event):
+        tool = self.current_tool.get()
+        if tool == "area" and self._area_start:
+            x = min(max(event.x // self.cell, 0), self.grid - 1)
+            y = min(max(event.y // self.cell, 0), self.grid - 1)
+            self._draw_area_rect(x, y)
+            return
         x, y = self._get_cell_coords(event)
         if x is None:
             return
-        tool = self.current_tool.get()
         if tool == "pencil":
-            self._set_pixel(x, y, self.current_color)
+            self._paint_brush(x, y, self.current_color)
         elif tool == "eraser":
-            self._set_pixel(x, y, None)
+            self._paint_brush(x, y, None)
+
+    def on_left_up(self, event):
+        if self.current_tool.get() != "area" or not self._area_start:
+            return
+        x0, y0 = self._area_start
+        x1 = min(max(event.x // self.cell, 0), self.grid - 1)
+        y1 = min(max(event.y // self.cell, 0), self.grid - 1)
+        self._area_start = None
+        self.canvas.delete("area_sel")
+        self.erase_area(x0, y0, x1, y1)
+
+    def _draw_area_rect(self, x, y):
+        x0, y0 = self._area_start
+        self.canvas.delete("area_sel")
+        self.canvas.create_rectangle(
+            min(x0, x) * self.cell, min(y0, y) * self.cell,
+            (max(x0, x) + 1) * self.cell, (max(y0, y) + 1) * self.cell,
+            outline="#FF0055", width=2, dash=(4, 3), tags="area_sel")
+
+    def erase_area(self, x0, y0, x1, y1):
+        self.save_undo_state()
+        for y in range(min(y0, y1), max(y0, y1) + 1):
+            for x in range(min(x0, x1), max(x0, x1) + 1):
+                self.pixels[y][x] = None
+        self.redraw_all()
+        self.status_label.configure(
+            text=f"Alan silindi: {abs(x1 - x0) + 1}x{abs(y1 - y0) + 1} piksel.")
+
+    def remove_background(self):
+        """Arka planı tek tıkla siler.
+
+        Tuval, yüklenen bir görselden geldiyse ve sonradan değiştirilmediyse arka plan
+        orijinal görselden (yüksek çözünürlükte) kaldırılır ve nesne tuvale yeniden
+        sığdırılır. Aksi halde tuvaldeki piksellerden kaldırılır.
+        """
+        if not self._has_pixels():
+            self.status_label.configure(text="Tuval zaten boş.")
+            return
+        before = sum(1 for row in self.pixels for c in row if c)
+        src = self._import_src
+        if (src and src[1] == self.grid and src[2] == encode_pixels(self.pixels)
+                and os.path.exists(src[0]) and load_pillow() is not None):
+            self.save_undo_state()
+            try:
+                self._place_image(src[0], True)
+            except Exception:
+                self.undo()
+                return
+            if encode_pixels(self.pixels) == src[2]:
+                self.undo_stack.pop()
+                self.status_label.configure(
+                    text="Kenarlara bağlı bir arka plan bulunamadı. Sihirli silgi veya Alan silgisini dene.")
+                return
+            self.status_label.configure(
+                text="Arka plan orijinal görselden kaldırıldı ve nesne tuvale sığdırıldı. "
+                     "Fazla/az sildiyse Ctrl+Z yapıp Tolerans'ı değiştir.")
+            return
+
+        seeds = find_background_seeds(self.pixels, self.tolerance_var.get())
+        self.save_undo_state()
+        removed = erase_similar_region(self.pixels, seeds, self.tolerance_var.get()) if seeds else 0
+        if removed == 0:
+            self.undo_stack.pop()
+            self.status_label.configure(
+                text="Kenarlara bağlı bir arka plan bulunamadı. Sihirli silgi veya Alan silgisini dene.")
+            return
+        self.redraw_all()
+        self.status_label.configure(
+            text=f"Arka plan kaldırıldı ({removed} / {before} piksel). "
+                 "Fazla/az sildiyse Ctrl+Z yapıp Tolerans'ı değiştir.")
 
     def on_right_down(self, event):
         x, y = self._get_cell_coords(event)
         if x is None:
             return
         self.save_undo_state()
-        self._set_pixel(x, y, None)
+        self._paint_brush(x, y, None)
 
     def on_right_drag(self, event):
         x, y = self._get_cell_coords(event)
         if x is not None:
-            self._set_pixel(x, y, None)
+            self._paint_brush(x, y, None)
 
     def _set_pixel(self, x: int, y: int, color):
         if self.pixels[y][x] == color:
@@ -754,46 +1078,55 @@ class PixelCursorStudio:
             return
         try:
             self.save_undo_state()
-            img = Image.open(file_path)
-            img.seek(0)  # GIF ise ilk kare
-            img = img.convert("RGBA")
-
-            # 1) Görselin etrafındaki boş (şeffaf) kenarları kırp
-            alpha_mask = img.getchannel("A").point(lambda a: 255 if a >= 32 else 0)
-            bbox = alpha_mask.getbbox()
-            if bbox:
-                img = img.crop(bbox)
-
-            # 2) En-boy oranını bozmadan ızgaraya sığdır
-            n = self.grid
-            w, h = img.size
-            scale = min(n / w, n / h)
-            nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
-            resample = Image.Resampling.BOX if scale < 1 else Image.Resampling.NEAREST
-            img = img.resize((nw, nh), resample)
-
-            # 3) Ortala
-            ox, oy = (n - nw) // 2, (n - nh) // 2
-            self.pixels = [[None] * n for _ in range(n)]
-            for y in range(nh):
-                for x in range(nw):
-                    r, g, b, a = img.getpixel((x, y))
-                    if a >= 100:
-                        self.pixels[oy + y][ox + x] = f"#{r:02X}{g:02X}{b:02X}"
-            self.hotspot = [ox, oy]
-            self.redraw_all()
+            self._place_image(file_path, self.auto_bg_var.get())
             name = os.path.basename(file_path)
             self.add_history("Görsel", name)
+            extra = " Arka plan kaldırıldı." if self.auto_bg_var.get() else ""
             self.status_label.configure(
-                text=f"'{name}' {n}x{n} piksel olarak aktarıldı ve geçmişe eklendi.")
+                text=f"'{name}' {self.grid}x{self.grid} piksel olarak aktarıldı ve geçmişe eklendi.{extra}")
         except Exception as e:
+            if self.undo_stack:
+                self.undo_stack.pop()
             messagebox.showerror("Görsel Hatası", f"Görsel yüklenemedi:\n{e}")
 
-    # ---------------------------------------------------------- .CUR --
-    def _hex_to_rgb(self, hex_str: str):
-        h = hex_str.lstrip("#")
-        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    def _place_image(self, file_path: str, remove_bg: bool):
+        """Görseli açar, (istenirse) arka planını kaldırır, kırpar, ızgaraya sığdırıp ortalar."""
+        img = Image.open(file_path)
+        img.seek(0)  # GIF ise ilk kare
+        img = img.convert("RGBA")
 
+        # 0) Düz/benzer renkli arka planı orijinal çözünürlükte kaldır
+        if remove_bg:
+            img = remove_image_background(img, self.tolerance_var.get())
+
+        # 1) Görselin etrafındaki boş (şeffaf) kenarları kırp
+        alpha_mask = img.getchannel("A").point(lambda a: 255 if a >= 32 else 0)
+        bbox = alpha_mask.getbbox()
+        if bbox:
+            img = img.crop(bbox)
+
+        # 2) En-boy oranını bozmadan ızgaraya sığdır
+        n = self.grid
+        w, h = img.size
+        scale = min(n / w, n / h)
+        nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+        resample = Image.Resampling.BOX if scale < 1 else Image.Resampling.NEAREST
+        img = img.resize((nw, nh), resample)
+
+        # 3) Ortala
+        ox, oy = (n - nw) // 2, (n - nh) // 2
+        self.pixels = [[None] * n for _ in range(n)]
+        for y in range(nh):
+            for x in range(nw):
+                r, g, b, a = img.getpixel((x, y))
+                if a >= 100:
+                    self.pixels[oy + y][ox + x] = f"#{r:02X}{g:02X}{b:02X}"
+        self.hotspot = [ox, oy]
+        self.redraw_all()
+        # Tuval bu görselden geldi: "Arka Planı Kaldır" orijinal dosyayı kullanabilsin
+        self._import_src = (file_path, n, encode_pixels(self.pixels))
+
+    # ---------------------------------------------------------- .CUR --
     def build_cur_bytes(self) -> bytes:
         n = self.grid
         hx, hy = self.hotspot
@@ -809,7 +1142,7 @@ class PixelCursorStudio:
                     xor_bytes.extend((0, 0, 0, 0))
                     bits[x // 8] |= 0x80 >> (x % 8)
                 else:
-                    r, g, b = self._hex_to_rgb(col)
+                    r, g, b = hex_to_rgb(col)
                     xor_bytes.extend((b, g, r, 255))
             and_bytes.extend(bits)
 
@@ -959,6 +1292,9 @@ class PixelCursorStudio:
             "color": self.current_color,
             "target_mode": self.target_cursor_mode.get(),
             "screen_size": self.screen_size.get(),
+            "brush": self.brush_var.get(),
+            "tolerance": self.tolerance_var.get(),
+            "auto_bg": self.auto_bg_var.get(),
         })
         try:
             write_json(self.state_file, self.settings)
